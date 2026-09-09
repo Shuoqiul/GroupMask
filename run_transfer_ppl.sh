@@ -2,9 +2,9 @@
 set -o pipefail
 
 EVAL_SCRIPT="${EVAL_SCRIPT:-hf_ppl.py}"
-HF_MODEL="${HF_MODEL:-Qwen/Qwen3-14B}"
-BASELINE_MODEL="${BASELINE_MODEL:-meta-llama/Llama-2-13b-hf}"
-HN_PATH="${HN_PATH:-./checkpoints/hn-ckpt-iter-030000.pt}"
+HF_MODEL="${HF_MODEL:-meta-llama/Llama-2-7b-hf}"
+BASELINE_MODEL="${BASELINE_MODEL:-meta-llama/Llama-2-7b-hf}"
+HN_PATH="${HN_PATH:-./outputs/groupsparsity/2026-09-06_12-51-44/hn-ckpt-iter-020000.pt}"
 SAVE_HF_DIR="${SAVE_HF_DIR:-./outputs/qwen3-14b-wiki-1-256}"
 
 send_notification() {

@@ -166,6 +166,10 @@ def apply_hn_gates_new(model, hn, hn_helper, device="cuda:0", param_reg=None, is
             m._cached_mask = None
     precache_masks(model, device=str(dev))
 
+C4_TRAIN_URL = ("https://huggingface.co/datasets/allenai/c4/resolve/main/"
+                "en/c4-train.00000-of-01024.json.gz")
+C4_VAL_URL   = ("https://huggingface.co/datasets/allenai/c4/resolve/main/"
+                "en/c4-validation.00000-of-00008.json.gz")
 
 
 def load_eval_data(dataset_name: str) -> str:
@@ -184,12 +188,7 @@ def load_eval_data(dataset_name: str) -> str:
         print(testdata)
         testdata = "\n\n".join(testdata["text"])
     elif dataset_name == "c4":
-        testdata = load_dataset(
-            "allenai/c4",
-            "allenai--c4",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            split="validation",
-        )
+        testdata = load_dataset("json", data_files={"validation": C4_VAL_URL}, split="validation")
         testdata = " ".join(testdata[:1100]["text"])
 
     elif dataset_name == "quick":

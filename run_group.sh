@@ -3,7 +3,7 @@ set -o pipefail
 
 LOG_DIR="${LOG_DIR:-./traininglogs}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-recipe_train_groupsparsity.py}"
-HF_MODEL="${HF_MODEL:-Qwen/Qwen3-14B}"
+HF_MODEL="${HF_MODEL:-meta-llama/Llama-2-7b-hf}"
 GROUPMASK_OUTPUT_ROOT="${GROUPMASK_OUTPUT_ROOT:-./outputs}"
 
 export GROUPMASK_OUTPUT_ROOT
@@ -33,6 +33,7 @@ torchrun \
   --use_minipile=false \
   --dataset_seed=42 \
   --dataset_list=['wiki'] \
+  # --n_calib_samples 100 \
   --total_n_step=30000 \
   --save_interval=10000 \
   --groups_in_dim=1 \

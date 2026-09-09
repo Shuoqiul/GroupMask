@@ -1,0 +1,11 @@
+# 忽略所有 .log 文件
+*.log
+
+# 忽略常见的日志文件夹
+logs/
+log/
+tmp/
+outputs/
+traininglogs/
+eval*/
+*.out
