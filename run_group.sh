@@ -20,6 +20,7 @@ send_notification() {
   fi
 }
 
+  # --n_calib_samples 100 \
 torchrun \
   --nproc_per_node="${NPROC_PER_NODE:-1}" \
   --master_port="${MASTER_PORT:-29503}" \
@@ -32,8 +33,7 @@ torchrun \
   --use_bf16=true \
   --use_minipile=false \
   --dataset_seed=42 \
-  --dataset_list=['wiki'] \
-  # --n_calib_samples 100 \
+  --dataset_list=['c4'] \
   --total_n_step=30000 \
   --save_interval=10000 \
   --groups_in_dim=1 \

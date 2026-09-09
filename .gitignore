@@ -1,5 +1,6 @@
 # 忽略所有 .log 文件
 *.log
+srun_*
 
 # 忽略常见的日志文件夹
 logs/
@@ -8,4 +9,5 @@ tmp/
 outputs/
 traininglogs/
 eval*/
+__pycache__/
 *.out
