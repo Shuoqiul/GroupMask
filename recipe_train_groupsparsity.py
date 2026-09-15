@@ -46,17 +46,28 @@ from flashlm.compression.semi_structure.hypernetwork import hypernetwork, simpli
 
 import hashlib
 
-C4_TRAIN_URL = ("https://huggingface.co/datasets/allenai/c4/resolve/main/"
-                "en/c4-train.00000-of-01024.json.gz")
-C4_VAL_URL   = ("https://huggingface.co/datasets/allenai/c4/resolve/main/"
-                "en/c4-validation.00000-of-00008.json.gz")
-
-def build_fixed_calibration_pool_c4(tokenizer, n_calib_samples: int,
-                                    block_size: int, seed: int = 0,
-                                    pool_save_path: str = None):
+def build_fixed_calibration_pool_c4(tokenizer, n_calib_samples: int, block_size: int, seed: int = 0, pool_save_path: str = None):
     from datasets import load_dataset, Dataset
+    import glob as _glob
 
-    raw = load_dataset("json", data_files={"train": C4_TRAIN_URL}, split="train")
+    # 统一从 HF_HOME 派生：<HF_HOME>/datasets/c4，与 shell 里的 HF_DATASETS_CACHE 同源
+    cache_root = os.environ.get(
+        "HF_DATASETS_CACHE",
+        os.path.join(os.environ.get("HF_HOME", ""), "datasets"),
+    )
+    c4_dir = os.path.join(cache_root, "c4")
+    local_files = sorted(_glob.glob(os.path.join(c4_dir, "c4-train.*-of-01024.json.gz")))
+
+    if local_files:
+        src = local_files[0]      # 校准池只用第一个 shard
+        print(f"[POOL] using local C4 shard: {src}")
+    else:
+        raise FileNotFoundError(
+            f"[POOL] no c4-train shards under {c4_dir}; compute node is offline, "
+            f"cannot fall back to URL. Check the directory."
+        )
+
+    raw = load_dataset("json", data_files={"train": src}, split="train")
     texts = [t for t in raw["text"] if t and t.strip()]
 
     g = torch.Generator().manual_seed(seed)
@@ -503,38 +514,38 @@ def main(
     elif dataset_list == ['alpaca']:
         train_dataset = load_hf_dataset_alpaca(split='train', n_shards=env.world_size * num_workers, seed=dataset_seed)
     elif dataset_list == ['c4']:
-        # streaming C4: 只下载前 c4_n_shards 个 shard，避开 350GB 全量下载
-        # 踩坑记录: 不能用 "allenai/c4" + config（新版 datasets 的 split 校验会炸），
-        # 必须走通用 json builder 直接读 jsonl.gz
-        from datasets import load_dataset as _load_ds
-        c4_urls = [
-            "https://huggingface.co/datasets/allenai/c4/resolve/main/"
-            f"en/c4-train.{i:05d}-of-01024.json.gz"
-            for i in range(c4_n_shards)
-        ]
+        # C4: 优先用本地已下载的 shard（计算节点无外网），缺失时回退到 URL 流式下载
+        import glob as _glob
+        c4_local_dir = os.environ.get("C4_LOCAL_DIR", "/orange/sgao1/sli/data/c4")
+        c4_files = sorted(_glob.glob(os.path.join(c4_local_dir, "c4-train.*-of-01024.json.gz")))[:c4_n_shards]
+
+        if len(c4_files) < c4_n_shards:
+            # 本地不够就回退原来的 URL 方式（需要外网，仅登录节点/有网节点可用）
+            env.print_master(f"[C4] local shards {len(c4_files)}/{c4_n_shards}, falling back to URLs")
+            c4_sources = [
+                "https://huggingface.co/datasets/allenai/c4/resolve/main/"
+                f"en/c4-train.{i:05d}-of-01024.json.gz"
+                for i in range(c4_n_shards)
+            ]
+        else:
+            c4_sources = c4_files
+            env.print_master(
+                f"[C4] streaming {len(c4_files)} local shard(s) from {c4_local_dir}"
+            )
+
         train_dataset = _load_ds(
             "json",
-            data_files={"train": c4_urls},
+            data_files={"train": c4_sources},
             split="train",
             streaming=True,
         )
-        # 过滤空文档 + 只保留 text 列（对齐 wiki loader 的输出格式）
+        train_dataset = train_dataset.shuffle(seed=dataset_seed, buffer_size=10_000)
         train_dataset = train_dataset.filter(
             lambda x: bool(x["text"] and x["text"].strip()),
-            num_proc=None,  # streaming 不支持多进程 filter，靠下游 num_workers
         )
         if hasattr(train_dataset, "select_columns"):
             train_dataset = train_dataset.select_columns(["text"])
-        # doc-level shuffle：buffer 洗牌，保证给 HN 的 batch 是混合的
-        train_dataset = train_dataset.shuffle(
-            seed=dataset_seed, buffer_size=10_000,
-        )
-        if env.global_rank == 0:
-            env.print_master(
-                f"[C4] streaming from {c4_n_shards} shard(s) "
-                f"(~{c4_n_shards * 0.35:.1f}GB download, ~{c4_n_shards * 300}M tokens) "
-                f"seed={dataset_seed}"
-            )
+            
     train_dataloader_hn = dataloader_creator(
         dataset=train_dataset,
         tokenizer=tokenizer,
