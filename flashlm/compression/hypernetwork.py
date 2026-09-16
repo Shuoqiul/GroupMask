@@ -295,7 +295,8 @@ class virtual_operation(nn.Module):
             self.bias = bias.squeeze()
 
 class simplifed_gate(nn.Module):
-    def __init__(self, t_structures, num_groups=1, reinmax=False):
+    def __init__(self, t_structures, num_groups=1, reinmax=False,
+                 prior_scores=None, prior_alpha=0.0):
         super(simplifed_gate, self).__init__()
         self.T = 0.4
         self.base = 3.0
@@ -303,7 +304,19 @@ class simplifed_gate(nn.Module):
 
         self.p_list = nn.ParameterList([nn.Parameter(torch.randn(t_structures[i])) for i in range(len(t_structures))])
         self.groups = num_groups
-        
+
+        # MaskLLM Eq.10-style prior injection: one-time offset on the learnable
+        # logits at init. It lives inside p_list afterwards, so checkpoints carry
+        # it automatically and eval needs no extra work.
+        if prior_scores is not None and prior_alpha != 0.0:
+            assert len(prior_scores) == len(self.p_list), \
+                f"prior_scores has {len(prior_scores)} entries but {len(self.p_list)} structures"
+            with torch.no_grad():
+                for i in range(len(self.p_list)):
+                    self.p_list[i].add_(
+                        prior_alpha * prior_scores[i].to(
+                            device=self.p_list[i].device, dtype=self.p_list[i].dtype))
+
         if reinmax:
             self.approxiate_fucntion = reinmax_simple
             self.T = 1
@@ -336,7 +349,8 @@ class simplifed_gate(nn.Module):
         return tp_out
 
 class hypernetwork(nn.Module):
-    def __init__(self, t_structures, num_groups=1, reinmax=False, hard_flag=False, param_flag=False):
+    def __init__(self, t_structures, num_groups=1, reinmax=False, hard_flag=False, param_flag=False,
+                 prior_scores=None, prior_alpha=0.0):
         super(hypernetwork, self).__init__()
         self.T = 0.4
         self.base = 3.0
@@ -372,6 +386,22 @@ class hypernetwork(nn.Module):
 
         self.linear_list_tp = nn.ModuleList(self.linear_list_tp)
 
+        # Prior injection (plan Phase 5): a fixed, non-trainable offset added to
+        # the trunk logits every forward, mirroring simplifed_gate's init-time
+        # offset but surviving GRU training instead of being baked into params.
+        # Non-persistent buffers: state_dict format stays identical with/without
+        # prior, so old checkpoints keep loading; eval reproduces the offset by
+        # re-attaching the same scores (sidecar prior_scores.pt) before load.
+        self.prior_alpha = float(prior_alpha)
+        self.use_prior = prior_scores is not None and self.prior_alpha != 0.0
+        if prior_scores is not None:
+            assert len(prior_scores) == len(t_structures), \
+                f"prior_scores has {len(prior_scores)} entries but {len(t_structures)} structures"
+            for i, s in enumerate(prior_scores):
+                self.register_buffer(f"prior_score_{i}",
+                                     s.detach().clone().float().reshape(-1),
+                                     persistent=False)
+
         # self.ln_in = nn.LayerNorm([128])
         self.ln_tp = nn.LayerNorm([128])
         self.hard_flag = hard_flag
@@ -386,6 +416,14 @@ class hypernetwork(nn.Module):
     
     def param_forward(self,):
         return self.scale_list, self.bias_list
+
+    def _apply_prior(self, tp_out):
+        """Add the (optional) prior offset to trunk logits. Buffers are moved
+        together with the module by .to()/.cuda(), so no per-step host copy."""
+        if not self.use_prior:
+            return tp_out
+        return [tp_out[i] + self.prior_alpha * getattr(self, f"prior_score_{i}").to(tp_out[i].dtype)
+                for i in range(len(tp_out))]
 
     def forward(self, x):
         if self.ln_tp.weight.get_device() == -1:
@@ -410,7 +448,8 @@ class hypernetwork(nn.Module):
 
         tp_out = [F.gelu(self.ln_tp(outputs[i, :])) for i in range(len(self.linear_list_tp))]
         tp_out = [self.linear_list_tp[i](tp_out[i]) for i in range(len(self.linear_list_tp))]
-        
+        tp_out = self._apply_prior(tp_out)
+
         if not self.training:
             if self.reinmax:
                 if self.param_flag:
@@ -497,6 +536,7 @@ class hypernetwork(nn.Module):
         tp_out = [F.gelu(self.ln_tp(outputs[i, :])) for i in range(len(self.linear_list_tp))]
 
         tp_out = [self.linear_list_tp[i](tp_out[i]) for i in range(len(self.linear_list_tp))]
+        tp_out = self._apply_prior(tp_out)
 
         if self.reinmax:
             tp_out = [self.approxiate_fucntion(tp_out[i], offset=self.base, T=self.T, hard_sample=True)[0].squeeze() for i in range(len(self.linear_list_tp))]

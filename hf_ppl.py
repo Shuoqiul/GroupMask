@@ -94,6 +94,28 @@ def summarize_param(vectors, param_reg, tag="[GATE]", hard: bool = True):
         "param_total": weighted_total_params,
     }
 
+@torch.no_grad()
+def apply_nm_prune(model: nn.Module, n: int = 2, m: int = 4, verbose: bool = True) -> None:
+    """Magnitude-based N:M (e.g. 2:4) semi-structured pruning baseline (plan Phase 2).
+    Keeps the n largest-magnitude weights within every consecutive m along the
+    input dim of the LLaMA q/k/v/o/gate/up/down projections."""
+    target_patterns = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj')
+    pruned, total, kept = 0, 0, 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and any(p in name for p in target_patterns):
+            W = mod.weight.data
+            grouped = W.view(W.shape[0], -1, m)
+            thresh = grouped.abs().topk(n, dim=-1, largest=True, sorted=False).values.min(dim=-1, keepdim=True).values
+            mask = (grouped.abs() >= thresh).to(W.dtype).view_as(W)
+            mod.weight.data.mul_(mask)
+            pruned += 1
+            total += W.numel()
+            kept += mask.sum().item()
+    if verbose:
+        print(f"[NM] pruned {pruned} projections with {n}:{m}; "
+              f"global keep rate (these layers): {kept / max(total, 1):.4f}")
+
+
 def apply_hn_gates(model, hn, hn_helper, mode: str = "soft", device='cuda:0'):
     """Apply gates from hn to model.
     mode: "soft" to mirror training forward; "hard" to binarize.
@@ -556,6 +578,12 @@ def main(
     save_hf_dir: str = "./masked_llama_hf",
     share_qk: bool = False,
     is_simple_gate = False,
+    # ---- plan ICLR'27 additions ----
+    prior_scores_path: str = None,   # sidecar written by training; re-attaches the
+                                     # prior offset for hypernetwork ckpts at eval
+    nm_prune: bool = False,          # N:M magnitude baseline (no hn / no ckpt needed)
+    nm_n: int = 2,
+    nm_m: int = 4,
 ) -> None:
     env = DistributedEnv()
     print(f"[ENV] Torch {torch.__version__}, CUDA {torch.version.cuda}, Device {torch.cuda.get_device_name(0)} SM {torch.cuda.get_device_capability()}")
@@ -563,6 +591,20 @@ def main(
     # Ensure pad token exists for consistent CE/attention masks
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    if nm_prune:
+        # ---- N:M semi-structured magnitude baseline (plan Phase 2) ----
+        model = AutoModelForCausalLM.from_pretrained(hf_model, torch_dtype=torch.bfloat16)
+        model.eval().cuda()
+        apply_nm_prune(model, n=nm_n, m=nm_m)
+        evaluate(env, model, tokenizer, datasets=dataset, block_size=block_size, batch_limit=batch_limit)
+        if save_hf_dir:
+            model_cpu = model.to("cpu")
+            model_cpu.save_pretrained(save_hf_dir)
+            tokenizer.save_pretrained(save_hf_dir)
+            print(f"[NM] saved pruned HF model to: {save_hf_dir}")
+        return
+
     if semi_evaluate: # groupsparsity pruning
         # evaluate baseline llama2 
         if eval_baseline:
@@ -607,10 +649,29 @@ def main(
         precache_masks(model, device='cuda:0')
         
         param_reg = collect_info_reg(model, p = 0.5, lam = 1.0)
+        # ---- eval-time prior re-attachment (plan Phase 5) ----
+        # hypernetwork ckpts: the prior offset is forward-time, not stored in the
+        # state dict, so re-attach the training sidecar here. simplifed_gate
+        # ckpts already have the offset baked into p_list -> never re-apply.
+        eval_prior_scores = None
+        eval_prior_alpha = 0.0
+        if prior_scores_path:
+            if simple_gate:
+                print("[PRIOR] simple_gate ckpts carry the prior inside p_list; ignoring --prior_scores_path")
+            else:
+                blob = torch.load(prior_scores_path, map_location='cpu')
+                eval_prior_scores = blob["scores"]
+                eval_prior_alpha = float(blob.get("meta", {}).get("alpha", 0.0))
+                assert len(eval_prior_scores) == len(param_reg.structures), \
+                    "prior_scores_path structures do not match this model's gate structures"
+                print(f"[PRIOR] eval prior offset re-attached: mode={blob.get('meta', {}).get('mode')} "
+                      f"alpha={eval_prior_alpha} n_struct={len(eval_prior_scores)}")
         if simple_gate:
             hn = simplifed_gate(t_structures = param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax)
+            hn.T = T
         else:
-            hn = hypernetwork(t_structures = param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax, param_flag=semi_params)
+            hn = hypernetwork(t_structures = param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax, param_flag=semi_params,
+                              prior_scores=eval_prior_scores, prior_alpha=eval_prior_alpha)
             hn.T = T
 
         hn_helper = help_functions_hn(param_reg.structures)

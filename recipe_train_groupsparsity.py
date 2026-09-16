@@ -392,6 +392,13 @@ def main(
     share_qk: bool = False,
     n_calib_samples: int = 0,      # 0 = original behavior (full wiki shard loader)
     c4_n_shards: int = 8,          # 每个 shard ~350MB / ~3亿 token，8 个 ≈ 2.8GB 下载
+    # ---- plan ICLR'27 Phase 4/5 additions ----
+    prior_mode: str = 'none',      # none | magnitude (档位0) | wanda (档位1)
+    prior_alpha: float = 0.0,      # prior 偏移强度; 0 = 关闭 (即使 prior_mode 非 none)
+    prior_n_samples: int = 8,      # wanda 档位1 用的校准 batch 数
+    uniform_alloc: bool = False,   # True = 每层强制 p (uniform baseline); False = 全局预算自适应分配
+    flip_log_interval: int = 50,   # hard-mask 翻转率诊断打印间隔 (steps)
+    alloc_log_interval: int = 500, # per-layer keep-rate CSV 落盘间隔 (steps)
 
 ):
     env = DistributedEnv()
@@ -584,18 +591,57 @@ def main(
         param_reg = collect_info_share(model, p=p, lam=lam)
         hn_helper = help_functions_share(param_reg.structures, gamma=gamma)
     else:
-        param_reg = collect_info_reg(model, p=p, lam=lam)
+        param_reg = collect_info_reg(model, p=p, lam=lam, per_layer=uniform_alloc)
         hn_helper = help_functions_hn(param_reg.structures, gamma=gamma)
+    if uniform_alloc:
+        env.print_master("[ALLOC] uniform_alloc=True: per-layer budget pinned to p (Uniform baseline, plan Phase 4)")
     # param_reg = collect_info_reg(model, p=p, lam=lam)
     # hn_helper = help_functions_hn(param_reg.structures, gamma=gamma)
-    
+
+    # ---- Prior score computation (plan Phase 5; offline, never trained) ----
+    # Frozen weights -> fixed group scores, saved once per run as a sidecar so
+    # resume reuses the identical tensors and eval (hf_ppl --prior_scores_path)
+    # re-attaches the same offset for hypernetwork runs. For simplifed_gate the
+    # offset is baked into p_list at init, so checkpoints already carry it.
+    prior_scores = None
+    if prior_mode != 'none' and prior_alpha != 0.0:
+        if share_qk:
+            env.print_master("[PRIOR] share_qk=True: prior injection unsupported for shared Q/K gates; running WITHOUT prior")
+        else:
+            prior_path = os.path.join(out_dir, "prior_scores.pt")
+            if os.path.exists(prior_path):
+                blob = torch.load(prior_path, map_location='cpu')
+                prior_scores = blob["scores"]
+                env.print_master(f"[PRIOR] reusing sidecar scores from {_redact_path(prior_path)} (meta={blob.get('meta')})")
+            else:
+                from flashlm.compression.semi_pruning_helper import compute_model_prior_scores
+                calib_input_ids = None
+                if prior_mode == 'wanda':
+                    calib_input_ids = []
+                    for k, batch in enumerate(train_dataloader_hn):
+                        calib_input_ids.append(batch["input_ids"][:, :hn_block_size].to(device_id))
+                        if k + 1 >= prior_n_samples:
+                            break
+                prior_scores = compute_model_prior_scores(
+                    unwrap_model(model), mode=prior_mode, calib_input_ids=calib_input_ids)
+                if env.global_rank == 0:
+                    torch.save(
+                        {"scores": [s.cpu() for s in prior_scores],
+                         "meta": {"mode": prior_mode, "alpha": prior_alpha,
+                                  "n_samples": prior_n_samples if prior_mode == 'wanda' else 0,
+                                  "structures": list(param_reg.structures)}},
+                        prior_path)
+                    env.print_master(f"[PRIOR] mode={prior_mode} alpha={prior_alpha} "
+                                     f"n_struct={len(prior_scores)} scores saved: {_redact_path(prior_path)}")
+
     if simple_gate:
-        hn = simplifed_gate(t_structures=param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax)
-    else:
-        hn = hypernetwork(t_structures=param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax, hard_flag=hard_flag, param_flag=semi_params)
+        hn = simplifed_gate(t_structures=param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax,
+                            prior_scores=prior_scores, prior_alpha=prior_alpha)
         hn.T = T
-        # data_type = torch.float16
-        # hn = hn.to(data_type)
+    else:
+        hn = hypernetwork(t_structures=param_reg.structures, num_groups=hn_groups, reinmax=use_reinmax, hard_flag=hard_flag, param_flag=semi_params,
+                          prior_scores=prior_scores, prior_alpha=prior_alpha)
+        hn.T = T
 
     hn_helper.set_mask_status(model, use_mask=True)
     hn_helper.set_scale_weight(model, scale_weight=scale_weight)
@@ -703,6 +749,9 @@ def main(
         pad_id=tokenizer.pad_token_id,
         # pad_id=PAD_ID,
         simple_gate=simple_gate,
+        batch_size=batch_size,
+        flip_log_interval=flip_log_interval,
+        alloc_log_interval=alloc_log_interval,
     )
     toc = time.time() - tic
     print("################# training finished")
@@ -742,6 +791,9 @@ def train_hn(
     pad_id=None,
     # pad_id=None,
     simple_gate = False,
+    batch_size: int = 1,
+    flip_log_interval: int = 50,
+    alloc_log_interval: int = 500,
 ) -> None:
     data_type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     device_id = env.local_rank
@@ -831,7 +883,9 @@ def train_hn(
     
     print("################# skip MOE")
     # env.print_master(hn)
-    
+
+    # cache of the last logged hard-mask bits, for the [FLIP] churn diagnostic
+    _prev_hard_bits = None
     # train
     for batch in train_hn_data:
         if iter_num >= max_iter:
@@ -1018,6 +1072,28 @@ def train_hn(
                         f"reg_hard={reg_hard.item():.6f}"
                     )
             # ---- END GATE CONSISTENCY TEST ----
+
+            # ---- [FLIP] hard-mask churn diagnostic (plan Phase 5: T=0.4 vs T=0.8) ----
+            if iter_num % flip_log_interval == 0:
+                cur_bits = torch.cat([ (h.detach().float().reshape(-1) > 0.5).to(torch.uint8)
+                                       for h in hard_vectors ]) if isinstance(hard_vectors, (list, tuple)) else \
+                           (hard_vectors.detach().float().reshape(-1) > 0.5).to(torch.uint8)
+                if _prev_hard_bits is not None and _prev_hard_bits.numel() == cur_bits.numel():
+                    flip_rate = (cur_bits != _prev_hard_bits).float().mean().item()
+                    env.print_master(f"[FLIP] iter={iter_num} interval={flip_log_interval} flip_rate={flip_rate:.6f}")
+                _prev_hard_bits = cur_bits
+
+            # ---- [ALLOC] per-layer keep-rate CSV (Uniform-vs-Adaptive figure) ----
+            if out_dir and env.global_rank == 0 and iter_num % alloc_log_interval == 0:
+                csv_path = os.path.join(out_dir, "layer_allocation.csv")
+                rates = param_reg.layer_keep_rates(hard_vectors)
+                write_header = not os.path.exists(csv_path)
+                with open(csv_path, "a") as f_csv:
+                    if write_header:
+                        f_csv.write("iter," + ",".join(f"l{i}" for i in range(len(rates))) + ",mean\n")
+                    f_csv.write(f"{iter_num}," + ",".join(f"{r:.4f}" for r in rates)
+                                + f",{sum(rates)/max(len(rates),1):.4f}\n")
+
             # Guard against Parameter rebind/reshape that breaks FSDP writeback mapping
             if use_fsdp and hasattr(model, "__baseline_param_meta__") and model.__baseline_param_meta__ is not None:
                 _changed = _diff_param_meta(model, model.__baseline_param_meta__)
@@ -1193,6 +1269,7 @@ def train_hn(
 
         toc = time.time() - tic
         tic = time.time()
+        tokens_done = iter_num * batch_size * hn_block_size * env.world_size
         if iter_num % log_interval == 0:
             if use_sch:
                 if soft_rank:
@@ -1205,9 +1282,9 @@ def train_hn(
                 if hn_moe_ddp_flag:
                     env.print_master(f"iter {iter_num}/{max_iter}: loss {(loss-reg_loss-pair_loss-width_loss-load_balance_loss-reg_c_loss).item():.4f}, reg_loss {reg_loss.item():.4f}, pair_loss {pair_loss.item():.4f}, width_loss {width_loss.item():.4f}, reg_c_loss {reg_c_loss.item():.4f}, balance_loss {load_balance_loss.item():.4f}, time: {toc*1000:.2f}msS")
                 elif hidden_kd:
-                    env.print_master(f"iter {iter_num}/{max_iter}: loss {loss.item():.4f}, reg_loss {reg_loss.item():.4f}, hidden_kd: {hidden_kd_loss.item():.4f}, time: {toc*1000:.2f}msS")
+                    env.print_master(f"iter {iter_num}/{max_iter}: loss {loss.item():.4f}, reg_loss {reg_loss.item():.4f}, hidden_kd: {hidden_kd_loss.item():.4f}, tokens: {tokens_done}, time: {toc*1000:.2f}msS")
                 else:
-                    env.print_master(f"iter {iter_num}/{max_iter}: loss {loss.item():.4f}, reg_loss {reg_loss.item():.4f}, time: {toc*1000:.2f}msS")
+                    env.print_master(f"iter {iter_num}/{max_iter}: loss {loss.item():.4f}, reg_loss {reg_loss.item():.4f}, tokens: {tokens_done}, time: {toc*1000:.2f}msS")
                     
         iter_num += 1
         # print("################################### training successful")

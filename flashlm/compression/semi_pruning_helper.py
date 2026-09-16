@@ -40,8 +40,132 @@ def log_inv_function(sum_params, sum_ori_params, p):
         loss = torch.log(p/clampled_p_ratio)
     return loss
 
+
+# ===================== Prior score utilities (plan Phase 5) =====================
+# Offline, non-trainable group-importance priors injected into the gate logits.
+# The score layout MUST match virtual_operation.forward's expansion, which has
+# TWO branches (guarded by the unit test test_prior_pooling.py):
+#   * 4-D branch (groups_in_dim>1 and groups_out_dim>1):
+#       gate (j,i) -> weight rows [j*g_out:(j+1)*g_out], cols [i*g_in:(i+1)*g_in]
+#   * 1-D branch (groups_in_dim==1 or groups_out_dim==1): p_v is
+#       repeat_interleave(g_in_dim*g_out_dim) then view(out_dim, in_dim), so
+#       gate k -> row k//(in_dim//R), cols [R*(k%(in_dim//R)) : +R], R=g_in_dim*g_out_dim
+
+def compute_group_prior_score(weight, ex_dict, act_norm=None):
+    """Per-group importance score for one SemiSparseLinear weight.
+
+    weight:    (out_dim, in_dim) tensor
+    ex_dict:   the virtual_operation ex_dict (groups/groups_dim bookkeeping)
+    act_norm:  optional (in_dim,) activation L2 norm for Wanda-style prior
+               (weight.abs() * act_norm, MaskLLM prior 档位1); None -> 档位0 magnitude.
+    Returns a zero-mean unit-std 1D score whose index order matches the gate
+    vector consumed by virtual_operation.set_vector_value/forward.
+    """
+    W = weight.detach().float()
+    if act_norm is not None:
+        W = W * act_norm.detach().float().reshape(1, -1).to(W.device)
+    prior = W.abs()
+    G_out, g_out = ex_dict['groups_out'], ex_dict['groups_out_dim']
+    G_in, g_in = ex_dict['groups_in'], ex_dict['groups_in_dim']
+    out_dim, in_dim = prior.shape
+    if g_in == 1 or g_out == 1:
+        # 1-D expansion branch: tiles are (row, R-long chunk of the input dim)
+        R = g_in * g_out
+        if in_dim % R != 0:
+            raise ValueError(f"1-D group layout needs in_dim % (groups_in_dim*groups_out_dim)==0, "
+                             f"got in_dim={in_dim}, R={R}")
+        pooled = prior.view(out_dim, in_dim // R, R).mean(-1).reshape(-1)
+    else:
+        pooled = prior.view(G_out, g_out, G_in, g_in).mean(dim=(1, 3)).reshape(-1)
+    return (pooled - pooled.mean()) / (pooled.std() + 1e-6)
+
+
+def _iter_virtual_ops_with_owner(model: nn.Module):
+    """Yield (owner SemiSparseLinear, its virtual_operation) in the exact order
+    collect_info_reg / help_functions_hn walk virtual ops (model.modules() DFS,
+    where the owner module always precedes its own virtual_operation child)."""
+    owner = None
+    for m in model.modules():
+        if hasattr(m, "virtual_operation") and hasattr(m, "linear"):
+            owner = m
+        if type(m).__name__ == "virtual_operation":
+            yield owner, m
+            owner = None
+
+
+@torch.no_grad()
+def collect_act_norms(model: nn.Module, calib_input_ids: List[torch.Tensor]) -> Dict[int, torch.Tensor]:
+    """Wanda-style per-input-channel activation L2 norm for every SemiSparseLinear.
+
+    Runs a dense (mask-off) forward over the calibration batches and returns
+    {id(owner_module): (in_dim,) norm tensor}. Batches are input_ids tensors
+    already on the model device."""
+    if not calib_input_ids:
+        raise ValueError("wanda prior requires at least one calibration batch")
+
+    stats = {}
+    hooks = []
+
+    def _make_hook(entry):
+        def hook(module, inputs, output):
+            x = inputs[0]
+            x = x.detach().float().reshape(-1, x.shape[-1]).to(entry['sq'].device)
+            entry['sq'] += x.pow(2).sum(dim=0)
+            entry['n'] += x.shape[0]
+        return hook
+
+    # remember mask_flag so the calibration forward sees the dense model
+    saved_flags = []
+    for m in model.modules():
+        if hasattr(m, "mask_flag"):
+            saved_flags.append((m, m.mask_flag))
+            m.mask_flag = False
+
+    was_training = model.training
+    model.eval()
+    try:
+        for owner, _vo in _iter_virtual_ops_with_owner(model):
+            device = owner.linear.weight.device
+            stats[id(owner)] = {'sq': torch.zeros(owner.linear.weight.shape[1], device=device), 'n': 0}
+        for owner, _vo in _iter_virtual_ops_with_owner(model):
+            hooks.append(owner.register_forward_hook(_make_hook(stats[id(owner)])))
+
+        from torch import autocast as _autocast
+        for ids in calib_input_ids:
+            attn = torch.ones_like(ids)
+            with _autocast(device_type='cuda', dtype=torch.bfloat16,
+                           enabled=torch.cuda.is_available()):
+                model(ids, attention_mask=attn)
+    finally:
+        for h in hooks:
+            h.remove()
+        if was_training:
+            model.train()
+        for m, flag in saved_flags:
+            m.mask_flag = flag
+
+    return {mid: torch.sqrt(entry['sq'] / max(entry['n'], 1)) for mid, entry in stats.items()}
+
+
+def compute_model_prior_scores(model: nn.Module, mode: str = "magnitude",
+                               calib_input_ids: Optional[List[torch.Tensor]] = None) -> List[torch.Tensor]:
+    """Prior scores for every gate structure, ordered like collect_info_reg.structures.
+
+    mode='magnitude' : |W| pooled to groups (零成本, 档位0)
+    mode='wanda'     : |W| * act_norm pooled to groups (一次校准前向, 档位1)"""
+    if mode not in ("magnitude", "wanda"):
+        raise ValueError(f"unknown prior mode: {mode}")
+    act_norms = collect_act_norms(model, calib_input_ids) if mode == "wanda" else {}
+    scores = []
+    for owner, vo in _iter_virtual_ops_with_owner(model):
+        scores.append(compute_group_prior_score(owner.linear.weight, vo.ex_dict,
+                                                act_norm=act_norms.get(id(owner))))
+    return scores
+
+# ================================================================================
+
 class collect_info_reg(nn.Module):
-    def __init__(self, model, p=None, lam=4.0):
+    def __init__(self, model, p=None, lam=4.0, per_layer=False):
         super(collect_info_reg, self).__init__()
         self.sum_ori_params = 0
         self.p = p
@@ -53,6 +177,11 @@ class collect_info_reg(nn.Module):
         self.lam = lam
         self.expand_rate = 1
         self.mlp_only = False
+        # per_layer=True -> uniform-allocation baseline (plan Phase 4): every
+        # layer is individually pulled to ratio p, so the cross-layer budget is
+        # forced uniform while within-layer mask placement stays learnable.
+        # per_layer=False (default) -> one global budget, allocation is adaptive.
+        self.per_layer = per_layer
         #self.rescale_factor = 1
         basic_flag = False
         # list.insert(0, "The")
@@ -90,6 +219,19 @@ class collect_info_reg(nn.Module):
             current_params = groups_rate*(self.in_dim_list[i]*self.out_dim_list[i])
             sum_params += current_params
         param_ratio = sum_params / (self.sum_ori_params)
+        if self.per_layer:
+            # each layer independently pinned to p (mean keeps the same loss
+            # scale as the single global log-ratio below)
+            loss = 0
+            for i in range(len(self.structures)):
+                layer_keep = vectors[i].sum()
+                layer_ratio = layer_keep / (self.in_group_list[i]*self.out_group_list[i])
+                if layer_ratio > self.p:
+                    loss_i = torch.log(torch.clamp(layer_ratio, min=self.p)/self.p)
+                else:
+                    loss_i = torch.log(self.p/torch.clamp(layer_ratio, max=self.p))
+                loss = loss + loss_i
+            return self.lam * loss / len(self.structures)
         if param_ratio>self.p:
             clampled_p_ratio = torch.clamp(param_ratio, min=self.p)
             loss = torch.log(clampled_p_ratio/self.p)
@@ -102,6 +244,13 @@ class collect_info_reg(nn.Module):
         # loss = custom_grad_weight.apply(loss, self.grad_w)
 
         return self.lam * loss
+
+    @torch.no_grad()
+    def layer_keep_rates(self, vectors):
+        """Hard (gate>0.5) keep fraction per structure — the cross-layer
+        allocation profile for the Uniform-vs-Adaptive figure."""
+        return [ (vectors[i].detach().float() > 0.5).float().mean().item()
+                 for i in range(len(self.structures)) ]
 
 
 class collect_info_share(nn.Module):
