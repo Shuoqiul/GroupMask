@@ -1,5 +1,6 @@
 # 忽略所有 .log 文件
 *.log
+groupmask_iclr2027_plan.md
 
 # 忽略常见的日志文件夹
 logs/
