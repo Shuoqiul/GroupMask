@@ -26,7 +26,7 @@ EVAL_SCRIPT="${BASE}/hf_ppl.py"
 SAVE_HF_DIR_ROOT="${BASE}/outputs/ppl-sweep"
 
 # ---- array 索引 → calib 目录映射 ----
-CALIB_LIST=(100 200 400 800)
+CALIB_LIST=(100 200 400 800 1600)
 CALIB=${CALIB_LIST[$SLURM_ARRAY_TASK_ID]}
 
 # ---- 自动解析“最新且含 hn-ckpt”的时间戳目录 ----
@@ -53,7 +53,7 @@ echo "[INFO] calib=${CALIB} resolved CKPT_DIR=${CKPT_DIR}"
 
 
 
-STEPS_LIST="5000 10000 15000 20000 25000 30000 35000 40000"   # 每 5000 一步，共 8 个
+STEPS_LIST="500 1000 1500 2000 2500 3000 3500 4000 4500 5000 5500 6000 6500 7000 7500 8000 8500 9000 9500 10000"   # 每 500 一步，共 20 个
 CKPT_GLOB="hn-ckpt-iter-*.pt"
 
 MASTER_PORT_BASE=29510

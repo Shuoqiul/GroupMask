@@ -34,7 +34,7 @@ MASTER_PORT=29503
 HF_MODEL="meta-llama/Llama-2-7b-hf"
 
 # ---- array 索引 → n_calib_samples 映射 ----
-CALIB_LIST=(100 200 400 800)
+CALIB_LIST=(100 200 400 800 1600)
 N_CALIB=${CALIB_LIST[$SLURM_ARRAY_TASK_ID]}
 # ========================================================
 
@@ -63,8 +63,8 @@ torchrun \
     --use_bf16=true \
     --use_minipile=false \
     --dataset_seed=42 \
-    --total_n_step=40000 \
-    --save_interval=5000 \
+    --total_n_step=10000 \
+    --save_interval=500 \
     --groups_in_dim=1 \
     --groups_out_dim=256 \
     --hn_groups=1 \
