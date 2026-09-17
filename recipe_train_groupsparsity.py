@@ -15,7 +15,7 @@ from torch import autocast
 from torch.cuda.amp import GradScaler
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer as HFLlamaDecoderLayer
-from datasets import IterableDataset
+from datasets import IterableDataset, load_dataset
 from flashlm.models import FlashLlamaForCausalLM, FlashLlamaTokenizer
 from flashlm.utils import DistributedEnv, softmax_fp32, log_softmax_fp32
 from flashlm.data import distributed_mixed_datasets, dataloader_creator, load_hf_dataset_pile_dedup, load_hf_dataset_minipile, load_hf_dataset_wiki, load_hf_dataset_alpaca, load_hf_dataset_wizardlMv2, load_hf_dataset_mixed, load_hf_dataset_new_mixed, load_hf_dataset_orca_dpo
@@ -540,7 +540,7 @@ def main(
                 f"[C4] streaming {len(c4_files)} local shard(s) from {c4_local_dir}"
             )
 
-        train_dataset = _load_ds(
+        train_dataset = load_dataset(
             "json",
             data_files={"train": c4_sources},
             split="train",
