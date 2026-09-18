@@ -50,12 +50,8 @@ def build_fixed_calibration_pool_c4(tokenizer, n_calib_samples: int, block_size:
     from datasets import load_dataset, Dataset
     import glob as _glob
 
-    # 统一从 HF_HOME 派生：<HF_HOME>/datasets/c4，与 shell 里的 HF_DATASETS_CACHE 同源
-    cache_root = os.environ.get(
-        "HF_DATASETS_CACHE",
-        os.path.join(os.environ.get("HF_HOME", ""), "datasets"),
-    )
-    c4_dir = os.path.join(cache_root, "c4")
+    # 统一从 HF_HOME 派生：<HF_HOME>/datasets/c4
+    c4_dir = os.path.join(os.environ.get("HF_HOME", ""), "datasets", "c4")
     local_files = sorted(_glob.glob(os.path.join(c4_dir, "c4-train.*-of-01024.json.gz")))
 
     if local_files:
@@ -523,7 +519,7 @@ def main(
     elif dataset_list == ['c4']:
         # C4: 优先用本地已下载的 shard（计算节点无外网），缺失时回退到 URL 流式下载
         import glob as _glob
-        c4_local_dir = os.environ.get("C4_LOCAL_DIR", "/orange/sgao1/sli/data/c4")
+        c4_local_dir = os.path.join(os.environ.get("HF_HOME", ""), "datasets", "c4")
         c4_files = sorted(_glob.glob(os.path.join(c4_local_dir, "c4-train.*-of-01024.json.gz")))[:c4_n_shards]
 
         if len(c4_files) < c4_n_shards:

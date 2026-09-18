@@ -24,7 +24,6 @@ conda activate /orange/sgao1/ZhengaoLi/Envs/torch2.7.0
 export HF_HOME=/orange/sgao1/sli/hf_cache
 export HF_HUB_CACHE="${HF_HOME}/hub"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export C4_LOCAL_DIR="${HF_DATASETS_CACHE}/c4"
 export HF_HUB_OFFLINE=1
 export PYTHONUNBUFFERED=1
 export MASTER_ADDR=127.0.0.1
